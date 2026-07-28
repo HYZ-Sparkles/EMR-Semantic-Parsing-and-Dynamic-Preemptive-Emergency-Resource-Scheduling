@@ -1,27 +1,54 @@
-/* 全局样式 - 干净配色，避免花哨渐变和 AI 风 emoji */
+/* ============================================================
+ * 全局样式（仅保留跨组件共享的部分）
+ *   1. :root 设计令牌（配色变量）—— 全站取色都从这里改
+ *   2. 基础复位（* / html / body / #app）
+ *   3. .panel 系列 —— 四个面板组件（语义解析/排队看板/资源/日志）共用的卡片外壳
+ * 组件各自的样式已下沉到对应 .vue 的 <style scoped>；布局样式见 App.vue。
+ * ============================================================ */
 
+/* ---- 1. 设计令牌：改配色只需动这里 ---- */
 :root {
-  --bg:        #f4f6f9;
-  --panel:    #ffffff;
-  --border:   #e3e6eb;
-  --text:     #2c3e50;
-  --text-2:   #5a6877;
-  --text-3:   #8a96a3;
-  --primary:  #2b6cb0;
-  --primary-2:#1f4f86;
-  --success:  #2f9e44;
-  --warning:  #c08a1a;
-  --danger:   #c0392b;
-  --danger-2: #8e2a20;
-  --idle:     #d8eee0;
-  --idle-fg:  #1d6e3a;
-  --busy:     #fbeac4;
-  --busy-fg:  #8a5b13;
-  --preempt:  #f4c7c3;
-  --preempt-fg:#7d261b;
-  --highlight:#fde68a;
+  --bg:        #f4f6f9;   /* 页面底色 */
+  --panel:    #ffffff;    /* 面板背景 */
+  --border:   #e3e6eb;    /* 通用边框 */
+  --text:     #2c3e50;    /* 主文字 */
+  --text-2:   #5a6877;    /* 次级文字 */
+  --text-3:   #8a96a3;    /* 弱化文字/占位 */
+  --primary:  #2b6cb0;    /* 主题色（页头、入队标签） */
+  --primary-2:#1f4f86;    /* 主题深色（匹配词文字） */
+  --success:  #2f9e44;    /* 成功/分配 */
+  --warning:  #c08a1a;    /* 警告/恶化 */
+  --danger:   #c0392b;    /* 危险/分数/抢占 */
+  --danger-2: #8e2a20;    /* 危险深色/挂起 */
+  --idle:     #d8eee0;    /* 资源：空闲底 */
+  --idle-fg:  #1d6e3a;    /* 资源：空闲字 */
+  --busy:     #fbeac4;    /* 资源：治疗底 */
+  --busy-fg:  #8a5b13;    /* 资源：治疗字 */
+  --preempt:  #f4c7c3;    /* 资源：抢占底 */
+  --preempt-fg:#7d261b;   /* 资源：抢占字 */
+  --highlight:#fde68a;    /* 文本高亮 */
+
+  /* 文字：白字（页头/徽章） */
+  --on-primary: #ffffff;
+  --on-danger:  #ffffff;
+  /* 事件徽章：恢复 */
+  --info:       #0c8599;
+
+  /* 浅色背景 */
+  --tag-bg:     #eef3fb;   /* 匹配词胶囊底 */
+  --queue-bg:   #f8fafc;   /* 队列条目底 */
+  --queue-top:  #fff8e1;   /* 队首条目底 */
+  --hint-bg:    #fff7e6;   /* 未识别提示底 */
+  --hint-border:#ffe7ba;   /* 未识别提示边 */
+
+  /* 阴影 */
+  --shadow-1:   rgba(0, 0, 0, 0.06);   /* 页头/分隔处的细阴影 */
+  --preempt-glow-0:  rgba(192, 57, 43, 0);      /* 抢占态边框外发光（0%） */
+  --preempt-glow-50: rgba(192, 57, 43, 0.35);   /* 抢占态边框外发光（50%） */
+  --on-primary-40:   rgba(255, 255, 255, 0.4);  /* 进度条槽半透白 */
 }
 
+/* ---- 2. 基础复位 ---- */
 * { box-sizing: border-box; }
 
 html, body, #app {
@@ -34,48 +61,9 @@ html, body, #app {
   font-size: 14px;
 }
 
-.app-shell {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-}
-
-.app-header {
-  background: var(--primary);
-  color: #fff;
-  padding: 14px 24px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  box-shadow: 0 1px 0 rgba(0,0,0,0.06);
-}
-.app-header h1 {
-  margin: 0;
-  font-size: 18px;
-  font-weight: 600;
-  letter-spacing: 0.5px;
-}
-.app-header .meta {
-  font-size: 12px;
-  opacity: 0.85;
-}
-
-.app-body {
-  flex: 1;
-  display: grid;
-  grid-template-columns: 360px 1fr 380px;
-  gap: 16px;
-  padding: 16px;
-  overflow: hidden;
-}
-
-@media (max-width: 1200px) {
-  .app-body {
-    grid-template-columns: 1fr;
-    grid-auto-rows: min-content;
-  }
-}
-
+/* ---- 3. 共享面板外壳（4 个面板组件复用）----
+ * 结构约定：.panel > .panel-header + .panel-body
+ * 面板整体是纵向 flex，body 占满剩余高度并可滚动。 */
 .panel {
   background: var(--panel);
   border: 1px solid var(--border);
@@ -95,7 +83,7 @@ html, body, #app {
   color: var(--text);
   font-size: 14px;
 }
-.panel-header .sub {
+.panel-header .sub {   /* 面板标题右侧的灰色小字副标题 */
   font-weight: 400;
   color: var(--text-3);
   font-size: 12px;
@@ -105,239 +93,4 @@ html, body, #app {
   padding: 14px 16px;
   overflow: auto;
   flex: 1;
-  min-height: 0;
 }
-
-.col-stack {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  min-height: 0;
-  overflow: hidden;
-}
-
-/* 急诊排队看板 */
-.queue-item {
-  display: flex;
-  align-items: center;
-  padding: 10px 12px;
-  background: #f8fafc;
-  border: 1px solid var(--border);
-  border-left: 4px solid var(--text-3);
-  border-radius: 6px;
-  margin-bottom: 8px;
-  transition: transform 0.2s, background 0.2s;
-}
-.queue-item.top {
-  background: #fff8e1;
-  border-left-color: var(--warning);
-}
-.queue-item .rank {
-  font-weight: 700;
-  font-size: 16px;
-  color: var(--text-2);
-  width: 32px;
-}
-.queue-item.top .rank { color: var(--danger); }
-.queue-item .name {
-  font-weight: 600;
-  flex: 1;
-  margin-right: 8px;
-}
-.queue-item .score {
-  font-weight: 700;
-  font-size: 16px;
-  color: var(--danger);
-  min-width: 36px;
-  text-align: right;
-}
-.queue-item .complaint {
-  font-size: 12px;
-  color: var(--text-3);
-  width: 100%;
-  margin-top: 2px;
-}
-.queue-item .meta-row {
-  width: 100%;
-  display: flex;
-  justify-content: space-between;
-  font-size: 12px;
-  color: var(--text-2);
-  margin-top: 2px;
-}
-
-/* 资源网格 */
-.resource-section {
-  margin-bottom: 18px;
-}
-.resource-section h4 {
-  margin: 0 0 8px;
-  font-size: 13px;
-  color: var(--text-2);
-  font-weight: 600;
-  letter-spacing: 0.5px;
-  text-transform: uppercase;
-}
-.resource-grid {
-  display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: 8px;
-}
-.resource-cell {
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 10px;
-  background: var(--idle);
-  color: var(--idle-fg);
-  font-size: 12px;
-  position: relative;
-  min-height: 90px;
-  display: flex;
-  flex-direction: column;
-  justify-content: space-between;
-}
-.resource-cell.idle { background: var(--idle); color: var(--idle-fg); }
-.resource-cell.treating { background: var(--busy); color: var(--busy-fg); }
-.resource-cell.preempted {
-  background: var(--preempt);
-  color: var(--preempt-fg);
-  animation: blink 1.2s ease-in-out infinite;
-}
-@keyframes blink {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(192, 57, 43, 0); }
-  50%      { box-shadow: 0 0 0 3px rgba(192, 57, 43, 0.35); }
-}
-.resource-cell .label {
-  font-weight: 600;
-  font-size: 13px;
-}
-.resource-cell .who {
-  margin-top: 4px;
-  font-size: 12px;
-  line-height: 1.4;
-  word-break: break-all;
-}
-.resource-cell .susp {
-  margin-top: 4px;
-  font-size: 11px;
-  color: var(--text-2);
-  border-top: 1px dashed currentColor;
-  padding-top: 4px;
-}
-.resource-cell .progress {
-  margin-top: 6px;
-  height: 4px;
-  background: rgba(255,255,255,0.4);
-  border-radius: 2px;
-  overflow: hidden;
-}
-.resource-cell .progress > span {
-  display: block;
-  height: 100%;
-  background: currentColor;
-  opacity: 0.6;
-  transition: width 0.3s linear;
-}
-
-/* 语义解析高亮 */
-.parse-input {
-  width: 100%;
-  min-height: 70px;
-  padding: 10px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  font-family: inherit;
-  font-size: 14px;
-  resize: vertical;
-}
-.parse-output {
-  margin-top: 12px;
-  padding: 12px;
-  background: #f8fafc;
-  border: 1px dashed var(--border);
-  border-radius: 6px;
-  font-size: 14px;
-  line-height: 1.8;
-  white-space: pre-wrap;
-  word-break: break-all;
-}
-.parse-output mark {
-  background: var(--highlight);
-  color: #5a3b00;
-  padding: 1px 3px;
-  border-radius: 3px;
-  font-weight: 600;
-}
-.score-badge {
-  display: inline-block;
-  background: var(--danger);
-  color: #fff;
-  padding: 2px 8px;
-  border-radius: 12px;
-  font-size: 12px;
-  margin-left: 4px;
-}
-.matched-list {
-  list-style: none;
-  padding: 0;
-  margin: 8px 0 0;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-.matched-list li {
-  background: #eef3fb;
-  color: var(--primary-2);
-  padding: 2px 8px;
-  border-radius: 10px;
-  font-size: 12px;
-}
-.matched-list li b { color: var(--danger); margin-left: 4px; }
-
-/* 事件日志 */
-.event-list {
-  font-size: 12px;
-  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
-  color: var(--text-2);
-}
-.event-list .row {
-  padding: 6px 8px;
-  border-bottom: 1px solid var(--border);
-  display: flex;
-  gap: 6px;
-}
-.event-list .row .t {
-  color: var(--text-3);
-  flex-shrink: 0;
-}
-.event-list .row .k {
-  font-weight: 700;
-  width: 76px;
-  flex-shrink: 0;
-  text-align: center;
-  border-radius: 3px;
-  padding: 1px 0;
-  color: #fff;
-  font-size: 11px;
-}
-.event-list .row .k.arrive    { background: var(--primary); }
-.event-list .row .k.assign    { background: var(--success); }
-.event-list .row .k.preempt   { background: var(--danger); }
-.event-list .row .k.suspend   { background: var(--danger-2); }
-.event-list .row .k.resume    { background: #0c8599; }
-.event-list .row .k.finish    { background: var(--text-2); }
-.event-list .row .k.deteriorate{ background: var(--warning); }
-
-/* 控制条 */
-.control-bar {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 8px 0;
-  flex-wrap: wrap;
-}
-.control-bar .stat {
-  font-size: 12px;
-  color: var(--text-2);
-}
-.control-bar .stat b { color: var(--text); }
