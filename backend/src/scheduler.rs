@@ -2,8 +2,8 @@
 // 职责：
 //   1) 接收新患者 (parse 后) -> 入堆
 //   2) 仿真 tick：推进在治资源、把在队患者按"等待时间"恶化、把堆顶尝试分配资源
-//   3) 抢占决策：没有空闲槽位时，弹堆顶，若堆顶分数 > 任意在治患者最低分则抢占
-//   4) 资源释放时恢复被挂起的患者
+//   3) 抢占决策：没有空闲槽位时，弹堆顶，从同类资源中危险分数最小的患者进行占用，要求 top.score 严格大于 victim.score 才抢占
+//   4) 资源释放时按 FIFO 恢复被挂起的患者
 //   5) 生成 Event 列表供前端展示
 
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use parking_lot::RwLock;
 use crate::heap::{IndexedMaxHeap, Entry};
 use crate::resources::{ResourceTable, SlotState, SuspendedPatient};
 use crate::term::{ResourceKind, TERMS, max_weight};
-use crate::trie::Trie;
+use crate::trie::{Trie,Match};
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Patient {
@@ -21,7 +21,7 @@ pub struct Patient {
     pub complaint: String,
     pub score: u32,           // 当前权重
     pub initial_score: u32,   // 入队时打分
-    pub matched: Vec<crate::trie::Match>,
+    pub matched: Vec<Match>,
     pub arrived_tick: u64,
     pub desired_kind: Option<ResourceKind>, // 推荐资源类别 (取最高权重词)
     pub state: PatientState,
@@ -66,8 +66,15 @@ pub struct Scheduler {
     pub events: Vec<SimEvent>,
     pub auto_running: bool,
     pub tick_ms: u64,            // 仿真步长 (毫秒)
-    pub deterioration_every: u64,// 每 N 个 tick 给在队患者加 1 分
-    pub deterioration_step: u32,
+    pub deterioration_every: u64,// 恶化所需步数
+    pub deterioration_point: u32, // 恶化一次增加的危险分
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ParseResult {
+    pub matched: Vec<Match>,
+    pub score: u32,
+    pub desired_kind: Option<ResourceKind>,
 }
 
 impl Scheduler {
@@ -86,7 +93,7 @@ impl Scheduler {
             auto_running: false,
             tick_ms: 2000,
             deterioration_every: 2,
-            deterioration_step: 1,
+            deterioration_point: 1,
         }
     }
 
@@ -97,7 +104,7 @@ impl Scheduler {
         let mut best_kind: Option<ResourceKind> = None;
         let mut best_w = 0u32;
         for h in &hits {
-            score = score.saturating_add(h.weight);
+            score = score.saturating_add(h.weight); // 饱和加法
             if h.weight > best_w {
                 best_w = h.weight;
                 best_kind = TERMS.iter().find(|t| t.word == h.word).map(|t| t.kind);
@@ -106,19 +113,31 @@ impl Scheduler {
         ParseResult { matched: hits, score, desired_kind: best_kind }
     }
 
-    /// 患者到达 (经 parse 后)
-    pub fn admit(&mut self, name: &str, complaint: &str) -> Option<(Patient, SimEvent)> {
+    /// 患者到达 (经 parse 后)。成功时返回 (Some(patient), arrive_event)；
+    /// 主诉里没识别到任何医学关键词时返回 (None, reject_event)，事件 push 到 self.events
+    /// 供前端做即时提示和事件日志留痕，Patient 结构本身不增加字段。
+    pub fn admit(&mut self, name: &str, complaint: &str) -> (Option<Patient>, SimEvent) {
         let parsed = self.parse(complaint);
         if parsed.matched.is_empty() {
-            // 没有任何医学关键词，但仍允许以 1 分入队
+            let reject_ev = SimEvent {
+                tick: self.tick,
+                kind: "reject".into(),
+                patient_id: None,
+                patient_name: Some(name.to_string()),
+                slot_id: None,
+                detail: "未识别到医学关键词，请补充主诉描述".into(),
+                score: None,
+            };
+            self.events.push(reject_ev.clone());
+            return (None, reject_ev);
         }
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = uuid::Uuid::new_v4().to_string(); // 随机数，几乎不可能重复id出现
         let mut p = Patient {
             id: id.clone(),
             name: name.to_string(),
             complaint: complaint.to_string(),
-            score: parsed.score.max(1),
-            initial_score: parsed.score.max(1),
+            score: parsed.score,
+            initial_score: parsed.score,
             matched: parsed.matched,
             arrived_tick: self.tick,
             desired_kind: parsed.desired_kind,
@@ -141,7 +160,7 @@ impl Scheduler {
             patient_id: Some(id.clone()),
             patient_name: Some(p.name.clone()),
             slot_id: None,
-            detail: format!("主诉「{}」 -> 解析得分 {}", complaint, p.score),
+            detail: format!("主诉 {} -> 解析得分 {}", complaint, p.score),
             score: Some(p.score),
         };
         self.heap.push(e);
@@ -152,7 +171,7 @@ impl Scheduler {
         self.try_assign_top_collect(&mut new_events);
         for e in new_events { self.events.push(e); }
         let pat = self.patients.get(&id).cloned().unwrap();
-        Some((pat, ev))
+        (Some(pat), ev)
     }
 
     /// 推进 1 个仿真 tick
@@ -160,33 +179,75 @@ impl Scheduler {
         self.tick += 1;
         let mut out = Vec::new();
         // 事件统一回写到 self.events (供 snapshot 展示)
-        // 1) 在队患者按等待时长恶化
+        // 1) 在队患者和被抢占患者按等待时长恶化
         let snapshot = self.heap.snapshot();
-        for e in &snapshot {
-            if self.tick % self.deterioration_every == 0 {
+        if self.tick % self.deterioration_every == 0 {
+            for e in &snapshot {
                 if let Some(p) = self.patients.get_mut(&e.id) {
                     if p.state == PatientState::Queued {
                         p.ticks_waited += self.deterioration_every as u32;
-                        p.score = (p.score + self.deterioration_step).min(max_weight() * 2);
+                        p.score = (p.score + self.deterioration_point).min(max_weight() * 2);
                         let ev = SimEvent {
                             tick: self.tick,
                             kind: "deteriorate".into(),
                             patient_id: Some(p.id.clone()),
                             patient_name: Some(p.name.clone()),
                             slot_id: None,
-                            detail: format!("等待 {} tick，病情恶化 +{}", p.ticks_waited, self.deterioration_step),
+                            detail: format!("等待 {} tick，病情恶化 +{}", p.ticks_waited, self.deterioration_point),
                             score: Some(p.score),
                         };
                         p.history.push(HistoryEvent { tick: self.tick, kind: "deteriorate".into(), detail: ev.detail.clone() });
                         out.push(ev);
                     }
                 }
-                self.heap.update_score(&e.id, self.patients.get(&e.id).map(|p| p.score).unwrap_or(0));
+                self.heap.update_score(&e.id, self.patients.get(&e.id).map(|p| p.score).unwrap());
+            }
+
+            let suspended_ids: Vec<String> = self.patients.iter()
+                .filter(|(_, p)| p.state == PatientState::Suspended)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in suspended_ids {
+                if let Some(p) = self.patients.get_mut(&id) {
+                    p.ticks_waited += self.deterioration_every as u32;
+                    p.score = (p.score + self.deterioration_point).min(max_weight() * 2);
+                    let slot_id = p.waiting_for_slot.clone();
+                    let new_score = p.score;
+                    let detail = format!("挂起等待 {} tick，病情恶化 +{}", p.ticks_waited, self.deterioration_point);
+                    let ev = SimEvent {
+                        tick: self.tick,
+                        kind: "deteriorate".into(),
+                        patient_id: Some(p.id.clone()),
+                        patient_name: Some(p.name.clone()),
+                        slot_id: slot_id.clone(),
+                        detail: detail.clone(),
+                        score: Some(new_score),
+                    };
+                    p.history.push(HistoryEvent { tick: self.tick, kind: "deteriorate".into(), detail: detail });
+                    // 同步 slot.suspended 队列里该患者的 score，以便 resume 时写回 slot.current_score
+                    if let Some(sid) = slot_id {
+                        if let Some(slot) = self.resources.slots.iter_mut().find(|s| s.id == sid) {
+                            for sp in slot.suspended.iter_mut() {
+                                if sp.patient_id == id {
+                                    sp.score = new_score;
+                                }
+                            }
+                        }
+                    }
+                    out.push(ev);
+                }
             }
         }
+
         // 2) 推进在治资源
         let outcomes = self.resources.tick();
         for o in outcomes {
+            // 从 slot_id 反查人类可读的 label（"rr-1" -> "抢救室-1"）。
+            // tick() 已经把资源切到 Idle，但 label 字段仍保留，直接 clone 出来即可。
+            let slot_label = self.resources.slots.iter()
+                .find(|s| s.id == o.slot_id)
+                .map(|s| s.label.clone())
+                .unwrap_or(o.slot_id.clone());
             if let Some(pid) = o.finished_patient.clone() {
                 if let Some(p) = self.patients.get_mut(&pid) {
                     p.state = PatientState::Finished;
@@ -197,7 +258,7 @@ impl Scheduler {
                         patient_id: Some(p.id.clone()),
                         patient_name: Some(p.name.clone()),
                         slot_id: Some(o.slot_id.clone()),
-                        detail: format!("完成治疗，释放资源 {}", o.slot_id),
+                        detail: format!("完成治疗，释放资源 {}", slot_label),
                         score: Some(p.score),
                     };
                     p.history.push(HistoryEvent { tick: self.tick, kind: "finish".into(), detail: ev.detail.clone() });
@@ -208,10 +269,12 @@ impl Scheduler {
             if let Some(slot) = self.resources.slots.iter_mut().find(|s| s.id == o.slot_id) {
                 if let Some(susp) = slot.suspended.pop_front() {
                     slot.state = SlotState::Treating;
-                    slot.current_patient = Some(susp.patient_id.clone());
+                    slot.current_patient_id = Some(susp.patient_id.clone());
+                    slot.current_score = Some(susp.score);
                     slot.remaining_ticks = susp.remaining_ticks.max(1);
                     slot.total_ticks = susp.total_ticks;
                     slot.preempted_by = None;
+                    slot.preempted_victim_id = None;
                     if let Some(p) = self.patients.get_mut(&susp.patient_id) {
                         p.state = PatientState::Treating;
                         p.treating_slot = Some(slot.id.clone());
@@ -236,50 +299,30 @@ impl Scheduler {
         // 全部入 self.events
         for e in &out { self.events.push(e.clone()); }
         // 控制事件长度 (避免内存膨胀)
-        if self.events.len() > 200 {
-            let drop = self.events.len() - 200;
+        if self.events.len() > 30 {
+            let drop = self.events.len() - 30;
             self.events.drain(0..drop);
         }
         out
-    }
-
-    /// 尝试把堆顶分配到资源；若没有空闲则考虑抢占。返回是否发生了动作
-    fn try_assign_top(&mut self) {
-        let mut sink = Vec::new();
-        self.try_assign_top_collect(&mut sink);
     }
 
     fn try_assign_top_collect(&mut self, out: &mut Vec<SimEvent>) {
         // 不断尝试直到堆顶没法分到资源 (资源耗尽 or 堆空)
         loop {
             let top = match self.heap.peek() { Some(e) => e.clone(), None => break };
-            // 该患者可能已经不在 Queued 状态 (e.g. 已治) — 跳过
-            let pstate = self.patients.get(&top.id).map(|p| p.state.clone());
-            if pstate.as_ref() != Some(&PatientState::Queued) {
-                // 已不在队：从堆里移除
-                self.heap.remove(&top.id);
-                continue;
-            }
             let desired = self.patients.get(&top.id).and_then(|p| p.desired_kind);
             // 1) 先找同类空闲
-            let slot_idx = if let Some(k) = desired {
-                self.resources.find_idle(k)
-                    .or_else(|| self.resources.find_idle(self.fallback_kind(k)))
-            } else {
-                self.resources.find_idle(ResourceKind::RescueRoom)
-                    .or_else(|| self.resources.find_idle(ResourceKind::CtScanner))
-                    .or_else(|| self.resources.find_idle(ResourceKind::OperatingRoom))
-                    .or_else(|| self.resources.find_idle(ResourceKind::Ultrasound))
-            };
+            let slot_idx = self.resources.find_idle(desired.unwrap());
             if let Some(idx) = slot_idx {
                 self.heap.pop();
                 let slot = &mut self.resources.slots[idx];
-                let dur = Self::treatment_ticks(slot.kind, self.patients.get(&top.id).map(|p| p.score).unwrap_or(1));
+                let top_score = self.patients.get(&top.id).map(|p| p.score).unwrap();
+                let dur = Self::treatment_ticks(top_score);
                 slot.state = SlotState::Treating;
-                slot.current_patient = Some(top.id.clone());
+                slot.current_patient_id = Some(top.id.clone());
+                slot.current_score = Some(top_score);
                 slot.remaining_ticks = dur;
                 slot.total_ticks = dur;
-                slot.preempted_by = None;
                 let pid = top.id.clone();
                 if let Some(p) = self.patients.get_mut(&pid) {
                     p.state = PatientState::Treating;
@@ -298,30 +341,11 @@ impl Scheduler {
                 }
                 continue;
             }
-            // 2) 没有空闲：考虑抢占同类里"剩余最少"的那个 (最低分)
-            if let Some(k) = desired {
-                if let Some(victim_idx) = self.resources.find_lowest_in_kind(k) {
-                    // 如果堆顶分 > 受害者分 (剩余 tick 越少代表分越低/越快好) -> 抢占
-                    let victim = &self.resources.slots[victim_idx];
-                    let victim_score = victim.current_patient.as_ref()
-                        .and_then(|pid| self.patients.get(pid))
-                        .map(|p| p.score)
-                        .unwrap_or(0);
-                    if top.score > victim_score {
-                        self.preempt(victim_idx, &top.id, out);
-                        continue;
-                    }
-                }
-            }
-            // 3) 抢全局最低 (只对 top score 显著高于才抢, 否则公平)
-            if let Some(victim_idx) = self.resources.find_lowest_treating() {
-                let victim = &self.resources.slots[victim_idx];
-                let victim_score = victim.current_patient.as_ref()
-                    .and_then(|pid| self.patients.get(pid))
-                    .map(|p| p.score)
-                    .unwrap_or(0);
-                // 抢的阈值：top 至少比 victim 高 3 分 (避免无意义抖动)
-                if top.score >= victim_score + 3 {
+            // 2) 同类资源中抢占：选分数最低的 victim ，
+            //    要求 top.score 严格大于 victim.score+3 才抢占，设置抖动阈值。
+            if let Some(victim_idx) = self.resources.find_lowest_score_in_kind(desired.unwrap()) {
+                let victim_score = self.resources.slots[victim_idx].current_score.unwrap();
+                if top.score > victim_score+3 {
                     self.preempt(victim_idx, &top.id, out);
                     continue;
                 }
@@ -330,24 +354,16 @@ impl Scheduler {
         }
     }
 
-    fn fallback_kind(&self, k: ResourceKind) -> ResourceKind {
-        match k {
-            ResourceKind::CtScanner => ResourceKind::RescueRoom,
-            ResourceKind::Ultrasound => ResourceKind::RescueRoom,
-            ResourceKind::OperatingRoom => ResourceKind::RescueRoom,
-            ResourceKind::RescueRoom => ResourceKind::CtScanner,
-        }
-    }
-
-    fn preempt(&mut self, victim_idx: usize, top_id: &str, out: &mut Vec<SimEvent>) {
-        // 1) 把 victim 状态从堆 -> 实际：在治，资源记录
+    fn preempt(&mut self, victim_idx: usize, pid: &str, out: &mut Vec<SimEvent>) {
+        // 1) 把 victim 当前的治疗上下文 (剩余 tick、总 tick) 写入该槽位的 suspended 队列。
+        //    victim 此刻不在线程队列里，只是把状态机置为 Suspended 以待恢复。
         let victim_slot = &mut self.resources.slots[victim_idx];
-        let victim_pid = victim_slot.current_patient.clone().unwrap();
+        let victim_pid = victim_slot.current_patient_id.clone().unwrap();
         let victim_remaining = victim_slot.remaining_ticks;
         let victim_total = victim_slot.total_ticks;
-        // 挂起到 suspended 链表头 (新被挂起的会最先恢复)
-        let victim_name = self.patients.get(&victim_pid).map(|p| p.name.clone()).unwrap_or_default();
-        let victim_score = self.patients.get(&victim_pid).map(|p| p.score).unwrap_or(0);
+        // suspended 是 FIFO: push_back 写到队尾，最早挂起的在 pop_front 时最先恢复。
+        let victim_name = self.patients.get(&victim_pid).map(|p| p.name.clone()).unwrap();
+        let victim_score = self.patients.get(&victim_pid).map(|p| p.score).unwrap();
         victim_slot.suspended.push_back(SuspendedPatient {
             patient_id: victim_pid.clone(),
             name: victim_name.clone(),
@@ -357,14 +373,19 @@ impl Scheduler {
             total_ticks: victim_total,
         });
         // 2) 抢占者上线
-        let top_score = self.heap.peek().map(|e| e.score).unwrap_or(0);
-        let dur = Self::treatment_ticks(victim_slot.kind, top_score);
-        let top_id_owned = top_id.to_string();
+        let top_score = self.heap.peek().map(|e| e.score).unwrap();
+        let dur = Self::treatment_ticks(top_score);
+        let top_id_owned = pid.to_string();
         victim_slot.state = SlotState::Preempted;
-        victim_slot.current_patient = Some(top_id_owned.clone());
+        victim_slot.current_patient_id = Some(top_id_owned.clone());
+        victim_slot.current_score = Some(top_score);
         victim_slot.remaining_ticks = dur;
         victim_slot.total_ticks = dur;
+        // 抢占者 = 新上线的 top_id；被抢走的原患者 = victim_pid。
+        // 这两个字段语义不同：preempted_by 给 UI 区分"刚被抢占"，
+        // preempted_victim_id 给 UI 找到"原来的患者是谁"。
         victim_slot.preempted_by = Some(top_id_owned.clone());
+        victim_slot.preempted_victim_id = Some(victim_pid.clone());
         // 3) 更新 victim 患者 -> Suspended
         if let Some(p) = self.patients.get_mut(&victim_pid) {
             p.state = PatientState::Suspended;
@@ -401,24 +422,10 @@ impl Scheduler {
         }
     }
 
-    fn treatment_ticks(kind: ResourceKind, score: u32) -> u32 {
-        // 越危重治疗周期越短 (假设越危重需要越快干预)
-        let base = match kind {
-            ResourceKind::RescueRoom => 6,
-            ResourceKind::CtScanner => 4,
-            ResourceKind::OperatingRoom => 8,
-            ResourceKind::Ultrasound => 3,
-        };
-        let reduce = (score / 5).min(3);
-        (base - reduce).max(2)
+    fn treatment_ticks(score: u32) -> u32 {
+        // 越危重治疗周期越长
+        (score/3).max(1)
     }
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct ParseResult {
-    pub matched: Vec<crate::trie::Match>,
-    pub score: u32,
-    pub desired_kind: Option<ResourceKind>,
 }
 
 pub type Shared = Arc<RwLock<Scheduler>>;

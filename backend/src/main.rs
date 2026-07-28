@@ -25,8 +25,9 @@ async fn main() {
     let sched: Shared = Arc::new(RwLock::new(Scheduler::new()));
     let (tx, _rx) = broadcast::channel::<api::SnapshotMsg>(64);
 
-    // tick loop (仿真时间步)
-    spawn_tick_loop(sched.clone());
+    // tick loop (仿真时间步) —— 必须和 HTTP 入口共享同一把 tx，
+    // 否则 auto 跑起来后前端 WS 永远收不到新快照
+    spawn_tick_loop(sched.clone(), tx.clone());
 
     let app = api::build_router(sched, tx);
     let listener = TcpListener::bind("0.0.0.0:7878").await.expect("bind");
@@ -34,9 +35,10 @@ async fn main() {
     serve(listener, app).await.unwrap();
 }
 
-fn spawn_tick_loop(sched: Shared) {
+fn spawn_tick_loop(sched: Shared, tx: tokio::sync::broadcast::Sender<api::SnapshotMsg>) {
     tokio::spawn(async move {
         loop {
+            // 200ms 轮询一次 auto_running，避免 step 线程独占 scheduler 锁
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             let (run, interval_ms) = {
                 let s = sched.read();
@@ -44,14 +46,9 @@ fn spawn_tick_loop(sched: Shared) {
             };
             if !run { continue; }
             tokio::time::sleep(std::time::Duration::from_millis(interval_ms.saturating_sub(200))).await;
-            // step 并收集事件
-            let events = {
-                let mut s = sched.write();
-                s.step()
-            };
-            if !events.is_empty() {
-                tracing::debug!(?events, "tick events");
-            }
+            // 通过 api.rs 提供的工具函数 step + broadcast，
+            // 走与 tick_handler 完全相同的路径，杜绝“step 了但忘了 broadcast”
+            api::step_and_broadcast(sched.clone(), tx.clone());
         }
     });
 }

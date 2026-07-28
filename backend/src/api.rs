@@ -1,11 +1,11 @@
 // HTTP + WebSocket API。
 //   POST /api/parse            { text } -> { matches, score, desired_kind }
-//   POST /api/admit            { name, complaint } -> { patient, events }
-//   GET  /api/snapshot         -> { tick, queue, patients, resources, events }
-//   POST /api/tick             -> { events } (手动 step)
-//   POST /api/auto             { running: bool, tick_ms?: number } -> ok
-//   POST /api/reset            -> ok
-//   GET  /api/terms            -> 词表
+//   POST /api/admit            { name, complaint } -> { patient, event }
+//   GET  /api/snapshot         -> { tick, queue, patients, resources, events, auto_running, tick_ms }
+//   POST /api/tick             -> { ok, events } (手动 step)
+//   POST /api/auto             { running, tick_ms? } -> { ok }
+//   POST /api/reset            -> { ok }
+//   GET  /api/terms            -> { terms: [{word, weight, kind}] }
 //   WS   /ws                   -> 推送完整 snapshot (广播通道)
 
 use axum::{
@@ -22,6 +22,7 @@ use crate::scheduler::{Scheduler, Shared, ParseResult, SimEvent, Patient, Patien
 use crate::term::ResourceKind;
 use crate::trie::Match;
 use crate::resources::ResourceSlot;
+use crate::term::TERMS;
 
 #[derive(Clone)]
 struct AppState {
@@ -51,20 +52,16 @@ pub fn build_router(sched: Shared, tx: broadcast::Sender<SnapshotMsg>) -> Router
         .route("/api/reset",    post(reset_handler))
         .route("/api/terms",    get(terms_handler))
         .route("/ws",           get(ws_handler))
-        .layer(CorsLayer::permissive())
         .with_state(state)
 }
 
 fn make_snapshot(sched: &Scheduler) -> SnapshotMsg {
     let queue: Vec<_> = sched.heap.snapshot().into_iter()
-        .filter_map(|e| sched.patients.get(&e.id).cloned())
-        .filter(|p| p.state == PatientState::Queued)
-        .collect();
+        .map(|e| sched.patients.get(&e.id).cloned().unwrap())
+        .collect(); // scheduler的代码决定了留在heap中必然就是Queued患者
     let patients: Vec<_> = sched.patients.values().cloned().collect();
     let resources = sched.resources.snapshot();
-    let mut events = sched.events.clone();
-    let len = events.len();
-    if len > 30 { events = events.split_off(len - 30); }
+    let events = sched.events.clone();
     SnapshotMsg {
         tick: sched.tick,
         queue,
@@ -78,7 +75,27 @@ fn make_snapshot(sched: &Scheduler) -> SnapshotMsg {
 
 fn broadcast_snapshot(state: &AppState, sched: &Scheduler) {
     let snap = make_snapshot(sched);
-    let _ = state.tx.send(snap);
+    if let Err(_e) = state.tx.send(snap) {
+        // 说明一个接收者都没有，snap 被原样返回在 e.into_inner() 里
+        tracing::warn!("没有前端在监听，快照被丢弃");
+    }
+}
+
+/// 给 main.rs 的 tick 循环用：推进一格仿真 + 广播快照。
+/// 把它和手动 tick 处理器走同一条路径，避免某处忘了 broadcast。
+pub fn step_and_broadcast(sched: Shared, tx: broadcast::Sender<SnapshotMsg>) {
+    let events = {
+        let mut s = sched.write();
+        s.step()
+    };
+    let snap = {
+        let s = sched.read();
+        make_snapshot(&s)
+    };
+    if !events.is_empty() {
+        tracing::debug!(?events, "tick events");
+    }
+    let _ = tx.send(snap);
 }
 
 #[derive(Deserialize)]
@@ -98,12 +115,9 @@ struct AdmitReq { name: String, complaint: String }
 struct AdmitResp { patient: Option<Patient>, event: Option<SimEvent> }
 async fn admit_handler(State(s): State<AppState>, Json(req): Json<AdmitReq>) -> Json<AdmitResp> {
     let mut sched = s.sched.write();
-    let (patient, event) = match sched.admit(&req.name, &req.complaint) {
-        Some((p, e)) => (Some(p), Some(e)),
-        None => (None, None),
-    };
+    let (patient, event) = sched.admit(&req.name, &req.complaint);
     broadcast_snapshot(&s, &sched);
-    Json(AdmitResp { patient, event })
+    Json(AdmitResp { patient, event: Some(event) })
 }
 
 async fn snapshot_handler(State(s): State<AppState>) -> Json<SnapshotMsg> {
@@ -142,7 +156,7 @@ async fn reset_handler(State(s): State<AppState>) -> Json<serde_json::Value> {
 }
 
 async fn terms_handler() -> Json<serde_json::Value> {
-    let list: Vec<_> = crate::term::TERMS.iter().map(|t| serde_json::json!({
+    let list: Vec<_> = TERMS.iter().map(|t| serde_json::json!({
         "word": t.word, "weight": t.weight, "kind": t.kind,
     })).collect();
     Json(serde_json::json!({ "terms": list }))

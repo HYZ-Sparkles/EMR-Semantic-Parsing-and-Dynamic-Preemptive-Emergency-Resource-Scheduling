@@ -86,7 +86,6 @@ impl IndexedMaxHeap {
             let old = e.score;
             e.score = new_score;
             let i = e.heap_idx;
-            drop(e); // 释放可变引用
             if new_score > old { self.sift_up(i); } else { self.sift_down(i); }
             return true;
         }
