@@ -98,6 +98,17 @@ code/
 
 ## 启动方法
 
+### 方式一：一键运行（无需任何开发环境）
+
+```bash
+cd backend && cargo build --release   # 产出 target/release/emr_scheduler.exe
+cd ../frontend && npm install && npm run build   # 产出 dist/
+```
+
+把 `emr_scheduler.exe` 与 `frontend/dist/` 放在同一目录（或将 exe 与 `frontend/` 放在一起），双击 exe，浏览器访问 **http://localhost:7878** 即可——后端会把 `dist/` 中的前端页面一并托管，API 与页面同源，单进程跑通全部功能。
+
+### 方式二：开发模式（热更新）
+
 需要 Rust 1.75+ 与 Node 18+。
 
 ```bash

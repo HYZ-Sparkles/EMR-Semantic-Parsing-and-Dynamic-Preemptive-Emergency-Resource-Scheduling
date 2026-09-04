@@ -8,6 +8,9 @@
 //   POST /api/reset            -> { ok }
 //   GET  /api/terms            -> { terms: [{word, weight, kind}] }
 //   WS   /ws                   -> 推送完整 snapshot (广播通道)
+//   GET  /* (其余路径)          -> 前端 dist/ 静态页面（单 exe 发布模式）
+
+use std::path::Path;
 
 use axum::{
     extract::{ws::WebSocket, ws::Message, State, WebSocketUpgrade},
@@ -17,6 +20,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
+use tower_http::services::{ServeDir, ServeFile};
 
 use crate::scheduler::{Scheduler, Shared, ParseResult, SimEvent, Patient};
 use crate::term::ResourceKind;
@@ -43,7 +47,7 @@ pub struct SnapshotMsg {
 
 pub fn build_router(sched: Shared, tx: broadcast::Sender<SnapshotMsg>) -> Router {
     let state = AppState { sched, tx };
-    Router::new()
+    let api = Router::new()
         .route("/api/parse",    post(parse_handler))
         .route("/api/admit",    post(admit_handler))
         .route("/api/random_admit", post(random_admit_handler))
@@ -53,7 +57,30 @@ pub fn build_router(sched: Shared, tx: broadcast::Sender<SnapshotMsg>) -> Router
         .route("/api/reset",    post(reset_handler))
         .route("/api/terms",    get(terms_handler))
         .route("/ws",           get(ws_handler))
-        .with_state(state)
+        .with_state(state);
+    attach_frontend(api)
+}
+
+/// 把前端构建产物 (dist/) 挂到未匹配 /api、/ws 的所有路径上，
+/// 使单个 exe 即可同时提供 API 与页面（前端 fetch/WS 全走相对路径，同源天然可达）。
+/// 查找顺序：进程工作目录旁的 dist/（发布包布局），其次 ../frontend/dist（cargo run 开发布局）。
+/// 都找不到则退化为纯 API 服务，开发时仍可配合 `npm run dev` 使用。
+fn attach_frontend(api: Router) -> Router {
+    let dist = [Path::new("./dist"), Path::new("../frontend/dist")]
+        .into_iter()
+        .find(|p| p.join("index.html").exists());
+    match dist {
+        Some(dir) => {
+            // fallback 到 index.html：单页应用刷新/直达任意路径都能返回页面本体
+            let serve = ServeDir::new(dir).fallback(ServeFile::new(dir.join("index.html")));
+            tracing::info!(?dir, "前端静态页面已挂载");
+            api.fallback_service(serve)
+        }
+        None => {
+            tracing::warn!("未找到前端 dist/（可先在 frontend/ 下执行 npm run build），当前仅提供 API");
+            api
+        }
+    }
 }
 
 fn make_snapshot(sched: &Scheduler) -> SnapshotMsg {

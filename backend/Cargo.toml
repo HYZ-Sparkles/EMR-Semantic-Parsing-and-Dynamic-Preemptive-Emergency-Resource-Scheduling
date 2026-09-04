@@ -13,6 +13,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 parking_lot = "0.12"
 rand = "0.8"
+tower-http = { version = "0.5", features = ["fs"] }
 
 [profile.dev]
 opt-level = 0
