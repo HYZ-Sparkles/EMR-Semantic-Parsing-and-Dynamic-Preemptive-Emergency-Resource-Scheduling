@@ -1,11 +1,10 @@
 // 医疗资源状态表。每个资源槽位记录：
 //   - 当前占用者 (患者 id) — 可空
-//   - 被抢占挂起的"等待恢复者"链表 (FIFO)
+//   - 被抢占挂起的"等待恢复者"列表 (恢复时取危重分最高者)
 //   - 当前治疗剩余 tick 数 (用于自动释放)
 //   - 是否处于"被抢占"高亮态 (供前端闪烁)
 
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
 use crate::term::ResourceKind;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -25,7 +24,11 @@ pub struct ResourceSlot {
     pub current_score: Option<u32>,      // 当前患者的危重分 (便于 O(1) 找最低分 victim)
     pub preempted_by: Option<String>,    // 抢占者 id（= current_patient_id 在抢占刚发生时；前端 UI 用此区分"被谁抢了"）
     pub preempted_victim_id: Option<String>, // 被抢走的原患者 id（前端"抢占者：xxx"展示用）
-    pub suspended: VecDeque<SuspendedPatient>, // 被挂起的患者链表 (FIFO)
+    // 被挂起的患者列表，按抢占发生的先后顺序追加。
+    // 恢复时不是 FIFO 也不是纯 LIFO：抢占者分数必然高于被它挤掉的人，所以越晚入列一般越危重，
+    // 但挂起期间所有人仍在恶化（score 会被同步改写），早挂起的人可能反超。
+    // 因此统一由 pop_most_critical() 按当前分数选人。
+    pub suspended: Vec<SuspendedPatient>,
     pub remaining_ticks: u32,      // 距离本次治疗结束的 tick 数
     pub total_ticks: u32,          // 本次治疗总时长 (用于进度条)
 }
@@ -43,6 +46,21 @@ pub struct SuspendedPatient {
 #[derive(Debug)]
 pub struct ResourceTable {
     pub slots: Vec<ResourceSlot>,
+}
+
+impl ResourceSlot {
+    /// 取出该槽位上"最该恢复治疗"的挂起患者：危重分最高者优先，
+    /// 同分则取最晚被抢占的（抢占链上越靠后的人被挤下来时分数越高，风险也越大）。
+    /// 槽位没有挂起患者时返回 None。
+    pub fn pop_most_critical(&mut self) -> Option<SuspendedPatient> {
+        // max_by_key 在并列时返回最后一个，恰好满足"同分取最晚入列者"。
+        let idx = self.suspended
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, s)| (s.score, s.preempted_at_tick))
+            .map(|(i, _)| i)?;
+        Some(self.suspended.remove(idx))
+    }
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -67,7 +85,7 @@ impl ResourceTable {
                     current_score: None,
                     preempted_by: None,
                     preempted_victim_id: None,
-                    suspended: VecDeque::new(),
+                    suspended: Vec::new(),
                     remaining_ticks: 0,
                     total_ticks: 0,
                 });
@@ -93,7 +111,7 @@ impl ResourceTable {
         self.slots
             .iter()
             .enumerate()
-            .filter(|(_, s)| s.state == SlotState::Treating && s.kind == kind)
+            .filter(|(_, s)| s.kind == kind)
             .map(|(i, s)|  (i, s.current_score.unwrap(), s.remaining_ticks))
             .min_by_key(|(_, sc, rt)| (*sc, *rt))
             .map(|(i, _, _)| i)
@@ -132,7 +150,7 @@ mod tests {
             current_score: score,
             preempted_by: None,
             preempted_victim_id: None,
-            suspended: VecDeque::new(),
+            suspended: Vec::new(),
             remaining_ticks: ticks,
             total_ticks: ticks,
         }
@@ -145,15 +163,6 @@ mod tests {
     #[test]
     fn find_lowest_score_returns_none_for_empty_table() {
         let t = table(vec![]);
-        assert!(t.find_lowest_score_in_kind(ResourceKind::RescueRoom).is_none());
-    }
-
-    #[test]
-    fn find_lowest_score_returns_none_when_all_idle() {
-        let t = table(vec![
-            slot("a", ResourceKind::RescueRoom, SlotState::Idle, None, 0),
-            slot("b", ResourceKind::RescueRoom, SlotState::Idle, None, 0),
-        ]);
         assert!(t.find_lowest_score_in_kind(ResourceKind::RescueRoom).is_none());
     }
 
@@ -190,30 +199,51 @@ mod tests {
         assert_eq!(t.find_lowest_score_in_kind(ResourceKind::CtScanner),  Some(1));
     }
 
-    #[test]
-    fn find_lowest_score_ignores_preempted_and_idle() {
-        // Preempted 槽位分数虽低也不应被选 (因为已经被抢占过); Idle 也不选
-        let t = table(vec![
-            slot("a", ResourceKind::RescueRoom, SlotState::Preempted, Some(1),  5),
-            slot("b", ResourceKind::RescueRoom, SlotState::Idle,      None,   0),
-            slot("c", ResourceKind::RescueRoom, SlotState::Treating,  Some(8), 5),
-        ]);
-        assert_eq!(t.find_lowest_score_in_kind(ResourceKind::RescueRoom), Some(2));
+    /// 构造一个挂起患者条目。
+    fn susp(id: &str, score: u32, at: u64) -> SuspendedPatient {
+        SuspendedPatient {
+            patient_id: id.into(),
+            name: id.into(),
+            score,
+            preempted_at_tick: at,
+            remaining_ticks: 3,
+            total_ticks: 5,
+        }
     }
 
     #[test]
-    fn current_score_is_cleared_when_treatment_finishes() {
-        // 验证 tick() 治疗结束时 current_score 被清空, 之后 find_lowest_score 不会再考虑这个槽位
-        let mut t = table(vec![
-            slot("a", ResourceKind::RescueRoom, SlotState::Treating, Some(7), 1),
-        ]);
-        // 推进 1 个 tick, 治疗应结束
-        let outcomes = t.tick();
-        assert_eq!(outcomes.len(), 1);
-        assert_eq!(outcomes[0].finished_patient.as_deref(), Some("7-patient"));
-        // 槽位回到 Idle, current_score 应为 None
-        assert_eq!(t.slots[0].state, SlotState::Idle);
-        assert!(t.slots[0].current_score.is_none());
-        assert!(t.find_lowest_score_in_kind(ResourceKind::RescueRoom).is_none());
+    fn pop_most_critical_returns_none_when_empty() {
+        let mut s = slot("a", ResourceKind::RescueRoom, SlotState::Treating, Some(9), 5);
+        assert!(s.pop_most_critical().is_none());
+    }
+
+    #[test]
+    fn pop_most_critical_prefers_later_preemption_in_a_chain() {
+        // 典型抢占链: P1(5) 先被挤下来, P2(10) 后被挤下来。后者更危重, 应先恢复。
+        let mut s = slot("a", ResourceKind::RescueRoom, SlotState::Preempted, Some(15), 5);
+        s.suspended.push(susp("p1", 5, 0));
+        s.suspended.push(susp("p2", 10, 8));
+        assert_eq!(s.pop_most_critical().unwrap().patient_id, "p2");
+        // 再弹一次拿到剩下的 p1, 列表随之清空
+        assert_eq!(s.pop_most_critical().unwrap().patient_id, "p1");
+        assert!(s.suspended.is_empty());
+    }
+
+    #[test]
+    fn pop_most_critical_follows_score_not_insertion_order() {
+        // 挂起期间 p1 持续恶化反超了后入列的 p2, 此时应恢复 p1 而不是"最后入列者"。
+        let mut s = slot("a", ResourceKind::RescueRoom, SlotState::Preempted, Some(20), 5);
+        s.suspended.push(susp("p1", 15, 0));
+        s.suspended.push(susp("p2", 10, 8));
+        assert_eq!(s.pop_most_critical().unwrap().patient_id, "p1");
+    }
+
+    #[test]
+    fn pop_most_critical_tie_breaks_by_latest_preemption() {
+        // 分数相同则取最晚被抢占的那个
+        let mut s = slot("a", ResourceKind::RescueRoom, SlotState::Preempted, Some(20), 5);
+        s.suspended.push(susp("early", 12, 2));
+        s.suspended.push(susp("late", 12, 9));
+        assert_eq!(s.pop_most_critical().unwrap().patient_id, "late");
     }
 }

@@ -32,6 +32,7 @@ const tick = computed(() => props.snapshot?.tick || 0)
 function kindLabel(k) {
   return ({
     arrive: '入队',
+    pending: '登记',
     assign: '分配',
     preempt: '抢占',
     suspend: '挂起',
@@ -72,6 +73,7 @@ function kindLabel(k) {
   font-size: 11px;
 }
 .event-list .row .k.arrive    { background: var(--primary); }
+.event-list .row .k.pending   { background: var(--info); }
 .event-list .row .k.assign    { background: var(--success); }
 .event-list .row .k.preempt   { background: var(--danger); }
 .event-list .row .k.suspend   { background: var(--danger-2); }

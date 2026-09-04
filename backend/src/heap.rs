@@ -22,14 +22,8 @@ pub struct IndexedMaxHeap {
 
 impl IndexedMaxHeap {
     pub fn len(&self) -> usize { self.data.len() }
-    pub fn is_empty(&self) -> bool { self.data.is_empty() }
+
     pub fn peek(&self) -> Option<&Entry> { self.data.first() }
-
-    pub fn contains(&self, id: &str) -> bool { self.pos.contains_key(id) }
-
-    pub fn get(&self, id: &str) -> Option<&Entry> {
-        self.pos.get(id).and_then(|i| self.data.get(*i))
-    }
 
     pub fn get_mut(&mut self, id: &str) -> Option<&mut Entry> {
         let i = *self.pos.get(id)?;

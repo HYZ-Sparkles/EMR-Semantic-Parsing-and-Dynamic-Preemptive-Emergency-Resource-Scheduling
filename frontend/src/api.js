@@ -17,8 +17,12 @@ export function parseComplaint(text) {
   return request('/api/parse', JSON_POST({ text }))
 }
 
-export function admitPatient(name, complaint) {
-  return request('/api/admit', JSON_POST({ name, complaint }))
+export function admitPatient(name, complaint, arriveInTicks = 0) {
+  return request('/api/admit', JSON_POST({ name, complaint, arrive_in_ticks: arriveInTicks }))
+}
+
+export function randomAdmit() {
+  return request('/api/random_admit', { method: 'POST' })
 }
 
 export function getSnapshot() {

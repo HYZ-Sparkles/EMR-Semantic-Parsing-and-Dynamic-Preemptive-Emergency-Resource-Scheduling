@@ -36,7 +36,7 @@
               </template>
             </div>
             <div v-if="r.state !== 'Idle' && r.suspended?.length" class="susp">
-              挂起：{{ r.suspended.map(s => s.name).join('、') }}
+              挂起：{{ suspendedNames(r).join('、') }}
             </div>
             <div v-if="r.state !== 'Idle'" class="progress">
               <span :style="{ width: progressPct(r) + '%' }"></span>
@@ -95,6 +95,15 @@ function patientName(pid) {
   if (!pid) return '-'
   const p = patientsById.value.get(pid)
   return p ? p.name : pid.slice(0, 4)
+}
+
+// 挂起名单按"恢复优先级"展示（危重分高者在前，同分取最晚被抢占者），
+// 与后端 ResourceSlot::pop_most_critical 的选人口径保持一致——
+// 后端返回的数组是入列顺序，直接展示会和实际恢复顺序相反。
+function suspendedNames(r) {
+  return [...(r.suspended || [])]
+    .sort((a, b) => b.score - a.score || b.preempted_at_tick - a.preempted_at_tick)
+    .map(s => s.name)
 }
 </script>
 

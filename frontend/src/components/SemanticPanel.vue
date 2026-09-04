@@ -10,7 +10,7 @@
         placeholder="例：患者突发咯血并伴随昏迷 1 小时"
         @input="onInput"
       />
-
+      
       <div v-if="parseResult">
         <!-- 有命中词：显示建议资源 + 命中列表 -->
         <template v-if="parseResult.matches.length > 0">
@@ -31,16 +31,31 @@
       </div>
       <el-divider style="margin: 14px 0 10px;" />
       <el-form label-position="top" size="small" @submit.prevent="onAdmit">
-        <el-form-item label="姓名">
-          <el-input v-model="name" placeholder="王女士" @keyup.enter="onAdmit" />
-        </el-form-item>
-        <el-button
-          type="primary"
-          style="width: 100%;"
-          :disabled="!text || !name || submitting"
-          :loading="submitting"
-          @click="onAdmit"
-        >送入急诊</el-button>
+        <div class="row-2col">
+          <el-form-item label="姓名" class="col-name">
+            <el-input v-model="name" placeholder="王女士" @keyup.enter="onAdmit" />
+          </el-form-item>
+          <el-form-item label="选择__ticks后到达(默认0)" class="col-arrive">
+            <el-radio-group v-model="arriveInTicks" class="arrive-group">
+              <el-radio-button v-for="n in 6" :key="n-1" :value="n-1" :label="n-1">{{ n-1 }}</el-radio-button>
+            </el-radio-group>
+          </el-form-item>
+        </div>
+        <div class="row-buttons">
+          <el-button
+            type="primary"
+            class="btn-primary"
+            :disabled="!text || !name || submitting"
+            :loading="submitting"
+            @click="onAdmit"
+          >登记</el-button>
+          <el-button
+            plain
+            class="btn-secondary"
+            :loading="submitting"
+            @click="onRandomAdmit"
+          >随机患者</el-button>
+        </div>
       </el-form>
     </div>
   </div>
@@ -48,7 +63,7 @@
 
 <script setup>
 import { ref, onBeforeUnmount } from 'vue'
-import { parseComplaint, admitPatient } from '../api.js'
+import { parseComplaint, admitPatient, randomAdmit } from '../api.js'
 import { kindLabel } from '../utils/kinds.js'
 import { ElMessage } from 'element-plus'
 
@@ -56,6 +71,7 @@ defineProps({ snapshot: Object })
 
 const text = ref('')
 const name = ref('')
+const arriveInTicks = ref(0) // 0=当前时刻; 1-5 表示 N tick 后到达
 const parseResult = ref(null)
 const submitting = ref(false)    // 防止连续 Enter / 双击造成重复入队
 let timer = null
@@ -86,9 +102,12 @@ async function onAdmit() {
   if (!name.value || !text.value) return
   submitting.value = true
   try {
-    const r = await admitPatient(name.value, text.value)
+    const r = await admitPatient(name.value, text.value, arriveInTicks.value)
     if (r.patient) {
       ElMessage.success(`${r.patient.name} 已入队，分诊分 ${r.patient.score}`)
+      name.value = ''
+    } else if (r.event && r.event.kind === 'pending') {
+      ElMessage.info(`${name.value} 已登记，${arriveInTicks.value} tick 后到达`)
       name.value = ''
     } else if (r.event && r.event.kind === 'reject') {
       ElMessage.warning(r.event.detail || '未识别到医学关键词')
@@ -100,6 +119,28 @@ async function onAdmit() {
     ElMessage.error('录入失败，请检查网络或后端状态')
   } finally {
     submitting.value = false   // 不论成功 / 失败 / reject，都释放锁
+  }
+}
+
+async function onRandomAdmit() {
+  if (submitting.value) return
+  submitting.value = true
+  try {
+    const r = await randomAdmit()
+    if (r.patient) {
+      ElMessage.success(`${r.patient.name} 已入队，分诊分 ${r.patient.score}`)
+    } else if (r.event && r.event.kind === 'pending') {
+      ElMessage.info(`${r.event.patient_name || '患者'} 已登记，分诊分 ${r.event.score ?? '?'}，将延迟到达`)
+    } else if (r.event && r.event.kind === 'reject') {
+      ElMessage.warning(r.event.detail || '未识别到医学关键词')
+    } else {
+      ElMessage.warning('随机录入失败')
+    }
+  } catch (e) {
+    console.error('随机入队请求失败', e)
+    ElMessage.error('随机录入失败，请检查网络或后端状态')
+  } finally {
+    submitting.value = false
   }
 }
 </script>
@@ -152,5 +193,41 @@ async function onAdmit() {
   border-radius: 4px;
   font-size: 12px;
 }
+
+/* 两列布局：姓名 60% + 到达时间 40%，节省垂直空间 */
+.row-2col {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+}
+.row-2col .col-name { flex: 0 0 50%; }
+.row-2col .col-arrive { flex: 1; min-width: 0; }
+/* 让 el-radio-button-group 撑满 + 单格更紧凑 */
+.arrive-group { display: flex; width: 100%; }
+.arrive-group :deep(.el-radio-button) { flex: 1; }
+.arrive-group :deep(.el-radio-button__inner) {
+  width: 100%;
+  padding: 4px 0;
+  font-size: 12px;
+}
+/* 选中的 radio 用主色高亮 */
+.arrive-group :deep(.el-radio-button__inner) {
+  border-color: var(--border);
+}
+.arrive-group :deep(.el-radio-button.is-active .el-radio-button__inner) {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: var(--on-primary);
+  box-shadow: -1px 0 0 0 var(--primary);
+}
+
+/* 操作按钮行：主按钮 70% + 副按钮 30% */
+.row-buttons {
+  display: flex;
+  gap: 10px;
+  margin-top: 4px;
+}
+.row-buttons .btn-primary { flex: 0 0 70%; }
+.row-buttons .btn-secondary { flex: 1; }
 </style>
 

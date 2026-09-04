@@ -1,6 +1,7 @@
 // HTTP + WebSocket API。
 //   POST /api/parse            { text } -> { matches, score, desired_kind }
-//   POST /api/admit            { name, complaint } -> { patient, event }
+//   POST /api/admit            { name, complaint, arrive_in_ticks? } -> { patient, event }
+//   POST /api/random_admit     {} -> { patient, event }   随机名 + 随机 2-3 病情 + 0-5 tick 后到达
 //   GET  /api/snapshot         -> { tick, queue, patients, resources, events, auto_running, tick_ms }
 //   POST /api/tick             -> { ok, events } (手动 step)
 //   POST /api/auto             { running, tick_ms? } -> { ok }
@@ -16,9 +17,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
-use tower_http::cors::CorsLayer;
 
-use crate::scheduler::{Scheduler, Shared, ParseResult, SimEvent, Patient, PatientState};
+use crate::scheduler::{Scheduler, Shared, ParseResult, SimEvent, Patient};
 use crate::term::ResourceKind;
 use crate::trie::Match;
 use crate::resources::ResourceSlot;
@@ -46,6 +46,7 @@ pub fn build_router(sched: Shared, tx: broadcast::Sender<SnapshotMsg>) -> Router
     Router::new()
         .route("/api/parse",    post(parse_handler))
         .route("/api/admit",    post(admit_handler))
+        .route("/api/random_admit", post(random_admit_handler))
         .route("/api/snapshot", get(snapshot_handler))
         .route("/api/tick",     post(tick_handler))
         .route("/api/auto",     post(auto_handler))
@@ -110,12 +111,24 @@ async fn parse_handler(State(s): State<AppState>, Json(req): Json<ParseReq>) -> 
 }
 
 #[derive(Deserialize)]
-struct AdmitReq { name: String, complaint: String }
+struct AdmitReq {
+    name: String,
+    complaint: String,
+    #[serde(default)]
+    arrive_in_ticks: u32,
+}
 #[derive(Serialize)]
 struct AdmitResp { patient: Option<Patient>, event: Option<SimEvent> }
 async fn admit_handler(State(s): State<AppState>, Json(req): Json<AdmitReq>) -> Json<AdmitResp> {
     let mut sched = s.sched.write();
-    let (patient, event) = sched.admit(&req.name, &req.complaint);
+    let (patient, event) = sched.admit(&req.name, &req.complaint, req.arrive_in_ticks);
+    broadcast_snapshot(&s, &sched);
+    Json(AdmitResp { patient, event: Some(event) })
+}
+
+async fn random_admit_handler(State(s): State<AppState>) -> Json<AdmitResp> {
+    let mut sched = s.sched.write();
+    let (patient, event) = sched.admit_random();
     broadcast_snapshot(&s, &sched);
     Json(AdmitResp { patient, event: Some(event) })
 }
